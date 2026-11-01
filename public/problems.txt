@@ -88,7 +88,7 @@ forall epsilon > 0, exists delta > 0 : abs(x - a) < delta => abs(f(x) - L) < eps
 f(x) = sum_(n = 0)^oo (f^((n))(a)) / (n!) (x - a)^n # f^((n))
 sup_(x in A) f(x) # sup
 inf_(x in A) f(x) # inf
-norm(f)_2 = (integral_a^b abs(f(x))^2 dif x)^(1 / 2)
+norm(f)_2 = (integral_a^b abs(f(x))^2 dif x)^(1 \/ 2)
 lim_(n -> oo) abs(a_(n + 1) / a_n) < 1
 nabla^2 f = (diff^2 f) / (diff x^2) + (diff^2 f) / (diff y^2) # nabla^2
 (diff u) / (diff t) = k nabla^2 u
@@ -97,4 +97,4 @@ hat(f)(xi) = integral_(-oo)^oo f(x) e^(-2 pi i x xi) dif x # hat, xi
 f(x) = 1 / (2 pi) integral_(-oo)^oo hat(f)(xi) e^(2 pi i x xi) dif xi
 c_n = 1 / (2 pi) integral_(-pi)^pi f(x) e^(-i n x) dif x
 sum_(n = -oo)^oo abs(c_n)^2 = 1 / (2 pi) integral_(-pi)^pi abs(f(x))^2 dif x
-sum_(k = 0)^(n - 1) e^(2 pi i k \/ n) = 0
+sum_(k = 0)^(n - 1) e^(2 pi i k / n) = 0
