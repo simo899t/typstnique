@@ -1,62 +1,44 @@
 import fs from "node:fs"
 import path from "node:path"
 import Link from "next/link"
-import { Button } from "@/components/ui/button"
-import { TypstTempViewer, type TypstFile } from "@/components/typst-temp-viewer"
+import { ArrowLeft, ArrowUpRight } from "lucide-react"
+import { Wordmark } from "@/components/wordmark"
+import { TypstExample } from "@/components/typst-example"
 
-const VIEWABLE_EXTENSIONS = new Set([
-  ".typ", ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".tex", ".bib",
-])
-const MAX_INLINE_BYTES = 256 * 1024
-
-function collectFiles(rootDir: string, dir: string): TypstFile[] {
-  const entries = fs.readdirSync(dir, { withFileTypes: true })
-  const files: TypstFile[] = []
-
-  for (const entry of entries) {
-    if (entry.name.startsWith(".")) continue
-    const full = path.join(dir, entry.name)
-    if (entry.isDirectory()) { files.push(...collectFiles(rootDir, full)); continue }
-    if (!entry.isFile()) continue
-
-    const stat = fs.statSync(full)
-    const ext = path.extname(entry.name).toLowerCase()
-    if (ext === ".pdf") continue
-    const relativePath = path.relative(rootDir, full).split(path.sep).join("/")
-    const isViewable = VIEWABLE_EXTENSIONS.has(ext) && stat.size <= MAX_INLINE_BYTES
-    const content = isViewable
-      ? fs.readFileSync(full, "utf8")
-      : `[Binary or large file (${stat.size} bytes). Download to view.]`
-    const pdfName = entry.name.replace(/\.[^.]+$/, ".pdf")
-    const pdfFull = path.join(dir, pdfName)
-    const pdfRelativePath = pdfName !== entry.name && fs.existsSync(pdfFull)
-      ? path.relative(rootDir, pdfFull).split(path.sep).join("/")
-      : undefined
-    files.push({ name: entry.name, size: stat.size, content, relativePath, pdfRelativePath })
-  }
-
-  return files.sort((a, b) => a.relativePath.localeCompare(b.relativePath))
-}
-
-export default function TemplatePage() {
-  const rootDir = path.join(process.cwd(), "public", "typst_temp")
-  const files = fs.existsSync(rootDir) ? collectFiles(rootDir, rootDir) : []
-  const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? ""
+export default function ExamplePage() {
+  const source = fs.readFileSync(path.join(process.cwd(), "public", "example", "main.typ"), "utf8")
 
   return (
-    <div className="h-screen flex flex-col">
-      <header className="flex items-center gap-4 px-4 py-2 border-b border-border bg-card shrink-0">
-        <Link href="/">
-          <Button variant="outline" size="sm" className="text-xs">
-            ← Home
-          </Button>
+    <div className="flex min-h-dvh flex-col md:h-dvh">
+      <header className="flex h-14 shrink-0 items-center gap-2 border-b bg-card/80 px-2 backdrop-blur-md sm:px-4">
+        <Link
+          href="/"
+          className="group flex items-center gap-2 rounded-md px-2 py-1 text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <ArrowLeft className="size-4 transition-transform group-hover:-translate-x-0.5" />
+          <Wordmark className="text-xl" />
         </Link>
-        <h1 className="font-serif text-lg tracking-tight">Template Viewer</h1>
+        <span className="text-muted-foreground/40">/</span>
+        <h1 className="text-sm font-medium">Example</h1>
+        <p className="ml-2 hidden truncate text-xs text-muted-foreground lg:block">
+          Edit the source and the pages re-render as you type, right in your browser.
+        </p>
+        <a
+          href="https://typst.app/universe/package/sdust"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+        >
+          <span className="font-mono">@preview/sdust</span>
+          <span className="hidden sm:inline">on Typst Universe</span>
+          <ArrowUpRight className="size-3.5" />
+        </a>
       </header>
 
-      <div className="flex-1 min-h-0">
-        <TypstTempViewer files={files} basePath={basePath} fullScreen />
-      </div>
+      <TypstExample
+        initialSource={source}
+        note="This is just an assignment from class, so it may include errors or mistakes."
+      />
     </div>
   )
 }

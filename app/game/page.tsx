@@ -2,13 +2,36 @@
 
 import { useState, useEffect, useRef, useCallback } from "react"
 import Link from "next/link"
+import type { LucideIcon } from "lucide-react"
+import {
+  ArrowLeft,
+  Check,
+  Eye,
+  EyeOff,
+  Lightbulb,
+  PanelRightClose,
+  PanelRightOpen,
+  RotateCcw,
+  SkipForward,
+} from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
+import { Wordmark } from "@/components/wordmark"
 import { cn } from "@/lib/utils"
+import {
+  checkAnswer,
+  extractLayout,
+  makeTypstDoc,
+  stripMathDelimiters,
+  type Layout,
+  type Verdict,
+} from "@/lib/answer-check"
+import { loadTypst } from "@/lib/typst-loader"
 
 type GameState = "loading" | "playing" | "done"
 
 type Problem = { math: string; hint?: string }
+
+type Solved = { answer: string; verdict: Verdict }
 
 function parseProblemsFile(text: string): Problem[] {
   return text
@@ -32,187 +55,70 @@ function parseProblemsFile(text: string): Problem[] {
     .filter((p): p is Problem => p !== null)
 }
 
-function makeTypstDoc(math: string) {
-  return [
-    "#set page(width: auto, height: auto, margin: (x: 10pt, y: 6pt), fill: none)",
-    "#set text(size: 22pt)",
-    `$ ${math} $`,
-  ].join("\n")
-}
+// typst.ts compiles one document at a time, so renders are queued (concurrent
+// calls can otherwise get each other's output). Results are cached by source
+// because the answer checker asks for the same formulas over and over.
+const svgCache = new Map<string, Promise<string>>()
+const layoutCache = new Map<string, Promise<Layout | null>>()
+let renderQueue: Promise<unknown> = Promise.resolve()
 
-// Make sure the SVG has the namespace declaration — browsers refuse to
-// render it inside <img> without one.
-function ensureSvgNamespace(svg: string): string {
-  if (/<svg[^>]*\sxmlns\s*=/.test(svg)) return svg
-  return svg.replace(/<svg\b/, '<svg xmlns="http://www.w3.org/2000/svg"')
-}
-
-// Load an SVG string into an HTMLImageElement so we can rasterize it.
-// Uses a base64 data URL + img.decode() for the most reliable cross-browser path.
-async function loadSvgImage(svg: string): Promise<HTMLImageElement | null> {
-  try {
-    const normalized = ensureSvgNamespace(svg)
-    const bytes = new TextEncoder().encode(normalized)
-    let binary = ""
-    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
-    const url = "data:image/svg+xml;base64," + btoa(binary)
-    const img = new Image()
-    img.src = url
-    await img.decode()
-    return img
-  } catch {
-    return null
+function renderSvg(math: string): Promise<string> {
+  let svg = svgCache.get(math)
+  if (!svg) {
+    svg = renderQueue.then(
+      // @ts-expect-error - $typst is loaded via CDN
+      () => window.$typst.svg({ mainContent: makeTypstDoc(math) }) as Promise<string>,
+    )
+    renderQueue = svg.catch(() => undefined)
+    svgCache.set(math, svg)
+    if (svgCache.size > 300) svgCache.delete(svgCache.keys().next().value!)
   }
-}
-
-// Parse SVG width/height attributes as fallback for naturalWidth/naturalHeight,
-// since some browsers report 0 for SVGs with pt-unit dimensions.
-function parseSvgSize(svg: string): { w: number; h: number } | null {
-  const wMatch = svg.match(/<svg[^>]*\swidth="([^"]+)"/)
-  const hMatch = svg.match(/<svg[^>]*\sheight="([^"]+)"/)
-  if (!wMatch || !hMatch) {
-    // Try viewBox as last resort.
-    const vb = svg.match(/<svg[^>]*\sviewBox="([\d.\s-]+)"/)
-    if (!vb) return null
-    const parts = vb[1].trim().split(/\s+/).map(Number)
-    if (parts.length !== 4 || parts.some(Number.isNaN)) return null
-    return { w: parts[2], h: parts[3] }
-  }
-  const toPx = (s: string) => {
-    const m = s.match(/^([\d.]+)\s*([a-z%]*)$/i)
-    if (!m) return NaN
-    const v = parseFloat(m[1])
-    const unit = m[2].toLowerCase()
-    if (unit === "pt") return v * (96 / 72)
-    if (unit === "" || unit === "px") return v
-    return v
-  }
-  const w = toPx(wMatch[1])
-  const h = toPx(hMatch[1])
-  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return null
-  return { w, h }
-}
-
-// Rasterize an image onto a white canvas of the given size, top-left aligned.
-function rasterize(img: HTMLImageElement, w: number, h: number): ImageData | null {
-  const canvas = document.createElement("canvas")
-  canvas.width = Math.max(1, Math.ceil(w))
-  canvas.height = Math.max(1, Math.ceil(h))
-  const ctx = canvas.getContext("2d")
-  if (!ctx) return null
-  ctx.fillStyle = "#ffffff"
-  ctx.fillRect(0, 0, canvas.width, canvas.height)
-  ctx.drawImage(img, 0, 0, img.naturalWidth, img.naturalHeight)
-  return ctx.getImageData(0, 0, canvas.width, canvas.height)
-}
-
-// Count what fraction of pixels differ between two equally-sized image buffers.
-// Uses luminance difference with a per-channel tolerance to absorb anti-aliasing noise.
-function pixelDiffRatio(a: ImageData, b: ImageData): number {
-  if (a.width !== b.width || a.height !== b.height) return 1
-  const ad = a.data
-  const bd = b.data
-  const len = ad.length
-  let diff = 0
-  for (let i = 0; i < len; i += 4) {
-    const aL = ad[i] * 0.299 + ad[i + 1] * 0.587 + ad[i + 2] * 0.114
-    const bL = bd[i] * 0.299 + bd[i + 1] * 0.587 + bd[i + 2] * 0.114
-    if (Math.abs(aL - bL) > 24) diff++
-  }
-  return diff / (len / 4)
-}
-
-// Strip the parts of an SVG that vary across renders without affecting the
-// visual output: variable ID suffixes, whitespace, formatting. Typst gives
-// glyphs stable content-derived IDs, so two visually-identical SVGs from the
-// same Typst version normalize to the same string.
-function normalizeSvgForCompare(svg: string): string {
   return svg
-    .replace(/\sid="[^"]*"/g, "")
-    .replace(/\sdata-tid="[^"]*"/g, "")
-    .replace(/\s(?:xlink:)?href="#[^"]*"/g, "")
-    .replace(/<!--[\s\S]*?-->/g, "")
-    .replace(/>\s+</g, "><")
-    .replace(/\s+/g, " ")
-    .trim()
 }
 
-// Compare two SVGs. Fast path: smart string normalization (catches identical
-// renders cheaply). Fallback: rasterize each to a canvas and pixel-diff.
-async function svgsLookEqual(svgA: string, svgB: string): Promise<boolean> {
-  if (normalizeSvgForCompare(svgA) === normalizeSvgForCompare(svgB)) return true
-
-  const [imgA, imgB] = await Promise.all([loadSvgImage(svgA), loadSvgImage(svgB)])
-  if (!imgA || !imgB) return false
-  const sizeA = imgA.naturalWidth > 0 && imgA.naturalHeight > 0
-    ? { w: imgA.naturalWidth, h: imgA.naturalHeight }
-    : parseSvgSize(svgA)
-  const sizeB = imgB.naturalWidth > 0 && imgB.naturalHeight > 0
-    ? { w: imgB.naturalWidth, h: imgB.naturalHeight }
-    : parseSvgSize(svgB)
-  if (!sizeA || !sizeB) return false
-
-  // If dimensions differ wildly, the images are clearly different.
-  // Allow up to 8% size difference to absorb sub-pixel rounding between identical-looking renders.
-  const wRatio = Math.min(sizeA.w, sizeB.w) / Math.max(sizeA.w, sizeB.w)
-  const hRatio = Math.min(sizeA.h, sizeB.h) / Math.max(sizeA.h, sizeB.h)
-  if (wRatio < 0.92 || hRatio < 0.92) return false
-
-  // Rasterize both onto a canvas sized to the union, padded with white.
-  const w = Math.max(sizeA.w, sizeB.w)
-  const h = Math.max(sizeA.h, sizeB.h)
-  const dataA = rasterize(imgA, w, h)
-  const dataB = rasterize(imgB, w, h)
-  if (!dataA || !dataB) return false
-
-  // Allow up to 1.5% of pixels to differ — handles anti-aliasing along glyph edges.
-  return pixelDiffRatio(dataA, dataB) < 0.015
+function layoutOf(math: string): Promise<Layout | null> {
+  let layout = layoutCache.get(math)
+  if (!layout) {
+    layout = renderSvg(math).then(extractLayout, () => null)
+    layoutCache.set(math, layout)
+    if (layoutCache.size > 300) layoutCache.delete(layoutCache.keys().next().value!)
+  }
+  return layout
 }
+
+const normalize = (s: string) => s.trim().replace(/\s+/g, " ")
 
 export default function TypstniquePage() {
   const [gameState, setGameState] = useState<GameState>("loading")
   const [problems, setProblems] = useState<Problem[]>([])
   const [currentIndex, setCurrentIndex] = useState(0)
-  const [solved, setSolved] = useState(0)
-  const [skipped, setSkipped] = useState(0)
-  const [solvedSet, setSolvedSet] = useState<Set<number>>(new Set())
+  const [solved, setSolved] = useState<Map<number, Solved>>(new Map())
   const [skippedSet, setSkippedSet] = useState<Set<number>>(new Set())
-  const [solvedAnswers, setSolvedAnswers] = useState<Map<number, string>>(new Map())
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [userInput, setUserInput] = useState("")
   const [targetSvg, setTargetSvg] = useState("")
-  const [targetSvgIndex, setTargetSvgIndex] = useState(-1)
   const [targetRenderError, setTargetRenderError] = useState<string | null>(null)
   const [previewSvg, setPreviewSvg] = useState("")
-  const [previewSvgInput, setPreviewSvgInput] = useState("")
   const [previewError, setPreviewError] = useState(false)
-  const [isCorrect, setIsCorrect] = useState(false)
   const [solutionShown, setSolutionShown] = useState(false)
   const [hintShown, setHintShown] = useState(false)
   const [typstReady, setTypstReady] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
-  const previewTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const advanceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const solvedAnswersRef = useRef<Map<number, string>>(new Map())
-  solvedAnswersRef.current = solvedAnswers
-
-  // Load Typst WASM
-  useEffect(() => {
-    const script = document.createElement("script")
-    script.type = "module"
-    script.src = "https://cdn.jsdelivr.net/npm/@myriaddreamin/typst-all-in-one.ts@0.6.0/dist/esm/index.js"
-    script.onload = () => {
-      setTypstReady(true)
-    }
-    document.head.appendChild(script)
-    return () => {
-      document.head.removeChild(script)
-    }
-  }, [])
+  const solvedRef = useRef<Map<number, Solved>>(solved)
+  solvedRef.current = solved
 
   // Load problems from file
   const [problemsLoaded, setProblemsLoaded] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
+
+  // Load Typst WASM
+  useEffect(() => {
+    loadTypst().then(
+      () => setTypstReady(true),
+      (e: Error) => setLoadError(e.message),
+    )
+  }, [])
 
   useEffect(() => {
     const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? ""
@@ -239,170 +145,127 @@ export default function TypstniquePage() {
     }
   }, [typstReady, problemsLoaded])
 
-  // Render target when problem changes
-  const renderTarget = useCallback(async () => {
-    if (!typstReady || problems.length === 0 || currentIndex >= problems.length) return
+  // The problem list starts collapsed on small screens.
+  useEffect(() => {
+    if (window.matchMedia("(max-width: 767px)").matches) setSidebarOpen(false)
+  }, [])
 
-    const indexAtCall = currentIndex
-    const math = problems[indexAtCall].math
-    try {
-      // @ts-expect-error - $typst is loaded via CDN
-      const svg = await window.$typst.svg({ mainContent: makeTypstDoc(math) })
-      setTargetSvg(svg)
-      setTargetSvgIndex(indexAtCall)
-      setTargetRenderError(null)
-    } catch (e) {
-      console.error("Typst target render error:", e)
-      setTargetSvg("")
-      setTargetSvgIndex(-1)
-      setTargetRenderError(e instanceof Error ? e.message : String(e))
+  // Render target when problem changes
+  useEffect(() => {
+    if (!typstReady || problems.length === 0) return
+    let cancelled = false
+    renderSvg(problems[currentIndex].math).then(
+      (svg) => {
+        if (cancelled) return
+        setTargetSvg(svg)
+        setTargetRenderError(null)
+      },
+      (e) => {
+        if (cancelled) return
+        console.error("Typst target render error:", e)
+        setTargetSvg("")
+        setTargetRenderError(e instanceof Error ? e.message : String(e))
+      },
+    )
+    return () => {
+      cancelled = true
     }
   }, [typstReady, problems, currentIndex])
 
   useEffect(() => {
-    renderTarget()
-    const savedAnswer = solvedAnswersRef.current.get(currentIndex)
-    if (savedAnswer !== undefined) {
-      setUserInput(savedAnswer)
-      setIsCorrect(true)
-    } else {
-      setUserInput("")
-      setIsCorrect(false)
-      requestAnimationFrame(() => inputRef.current?.focus())
-    }
+    const saved = solvedRef.current.get(currentIndex)
+    setUserInput(saved?.answer ?? "")
     setPreviewSvg("")
-    setPreviewSvgInput("")
     setPreviewError(false)
     setSolutionShown(false)
     setHintShown(false)
-    setTargetRenderError(null)
-  }, [renderTarget, currentIndex])
+    if (!saved) requestAnimationFrame(() => inputRef.current?.focus())
+    document.querySelector(`[data-problem="${currentIndex}"]`)?.scrollIntoView({ block: "nearest" })
+  }, [currentIndex])
 
-  // Live preview with debounce
-  useEffect(() => {
-    if (previewTimeoutRef.current) {
-      clearTimeout(previewTimeoutRef.current)
-    }
-
-    if (!userInput.trim()) {
-      setPreviewSvg("")
-      setPreviewError(false)
-      return
-    }
-
-    const capturedInput = userInput
-    previewTimeoutRef.current = setTimeout(async () => {
-      if (!typstReady) return
-      try {
-        // @ts-expect-error - $typst is loaded via CDN
-        const svg = await window.$typst.svg({ mainContent: makeTypstDoc(capturedInput) })
-        setPreviewSvg(svg)
-        setPreviewSvgInput(capturedInput)
-        setPreviewError(false)
-      } catch {
-        setPreviewSvg("")
-        setPreviewSvgInput("")
-        setPreviewError(true)
-      }
-    }, 200)
-
-    return () => {
-      if (previewTimeoutRef.current) {
-        clearTimeout(previewTimeoutRef.current)
-      }
-    }
-  }, [userInput, typstReady])
-
-  // Check for correct answer
-  const normalize = (s: string) => s.trim().replace(/\s+/g, " ")
-
-  const markCorrect = useCallback(
-    (answer: string) => {
-      setIsCorrect(true)
-      setSolved((s) => s + 1)
-      setSolvedSet((prev) => new Set(prev).add(currentIndex))
-      setSolvedAnswers((prev) => new Map(prev).set(currentIndex, answer))
-      // If this problem was previously skipped, move it out of the skipped bucket
-      // so completing it after a skip gives full credit.
-      setSkippedSet((prev) => {
-        if (!prev.has(currentIndex)) return prev
-        const next = new Set(prev)
-        next.delete(currentIndex)
-        setSkipped((s) => Math.max(0, s - 1))
-        return next
-      })
-      advanceTimeoutRef.current = setTimeout(() => {
-        advanceTimeoutRef.current = null
-        if (currentIndex + 1 >= problems.length) {
-          setGameState("done")
-        } else {
-          setCurrentIndex((i) => i + 1)
-        }
-      }, 600)
-    },
-    [currentIndex, problems.length]
-  )
-
-  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const value = e.target.value
-    setUserInput(value)
-
-    if (
-      !solvedSet.has(currentIndex) &&
-      normalize(value) === normalize(problems[currentIndex].math)
-    ) {
-      markCorrect(value)
-    }
-  }
-
-  // Accept any input whose rendered image matches the target (within tolerance).
-  // This makes alternative valid Typst forms succeed, and forgives tiny spacing
-  // differences that don't affect the visible output.
-  useEffect(() => {
-    if (!previewSvg || !targetSvg) return
-    if (targetSvgIndex !== currentIndex) return
-    if (previewSvgInput !== userInput) return
-    if (solvedSet.has(currentIndex)) return
-
-    let cancelled = false
-    svgsLookEqual(previewSvg, targetSvg).then((equal) => {
-      if (cancelled || !equal) return
-      // Guard again in case state moved on while we were rasterizing.
-      if (targetSvgIndex !== currentIndex) return
-      if (previewSvgInput !== userInput) return
-      if (solvedSet.has(currentIndex)) return
-      markCorrect(userInput)
-    })
-    return () => {
-      cancelled = true
-    }
-  }, [
-    previewSvg,
-    previewSvgInput,
-    targetSvg,
-    targetSvgIndex,
-    solvedSet,
-    currentIndex,
-    userInput,
-    markCorrect,
-  ])
-
-  const handleSkip = () => {
-    setSkipped((s) => s + 1)
-    setSkippedSet((prev) => new Set(prev).add(currentIndex))
+  const goNext = useCallback(() => {
     if (currentIndex + 1 >= problems.length) {
       setGameState("done")
     } else {
       setCurrentIndex((i) => i + 1)
     }
+  }, [currentIndex, problems.length])
+
+  const markCorrect = useCallback(
+    (answer: string, verdict: Verdict) => {
+      if (solvedRef.current.has(currentIndex)) return
+      const next = new Map(solvedRef.current).set(currentIndex, { answer, verdict })
+      solvedRef.current = next
+      setSolved(next)
+      // If this problem was previously skipped, move it out of the skipped bucket
+      // so completing it after a skip gives full credit.
+      setSkippedSet((prev) => {
+        if (!prev.has(currentIndex)) return prev
+        const s = new Set(prev)
+        s.delete(currentIndex)
+        return s
+      })
+      // Leave a little longer to read the reference when the answer only matched loosely.
+      advanceTimeoutRef.current = setTimeout(
+        () => {
+          advanceTimeoutRef.current = null
+          goNext()
+        },
+        verdict === "exact" ? 700 : 2000,
+      )
+    },
+    [currentIndex, goNext],
+  )
+
+  // Live preview with debounce, then check the answer against the target.
+  useEffect(() => {
+    const input = stripMathDelimiters(userInput)
+    if (!typstReady || !input) {
+      setPreviewSvg("")
+      setPreviewError(false)
+      return
+    }
+
+    let cancelled = false
+    const timer = setTimeout(async () => {
+      try {
+        const svg = await renderSvg(input)
+        if (cancelled) return
+        setPreviewSvg(svg)
+        setPreviewError(false)
+      } catch {
+        // Keep showing the last good render (dimmed) while the input is incomplete.
+        if (!cancelled) setPreviewError(true)
+        return
+      }
+
+      // Accept anything Typst draws the same way as the target, give or take
+      // some spacing — see lib/answer-check.ts.
+      if (solvedRef.current.has(currentIndex)) return
+      const verdict = await checkAnswer(problems[currentIndex].math, input, layoutOf)
+      if (!cancelled && verdict !== "wrong") markCorrect(userInput, verdict)
+    }, 150)
+
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [userInput, typstReady, currentIndex, problems, markCorrect])
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = e.target.value
+    setUserInput(value)
+    if (normalize(stripMathDelimiters(value)) === normalize(problems[currentIndex].math)) {
+      markCorrect(value, "exact")
+    }
   }
 
-  const handleToggleSolution = () => {
-    setSolutionShown((shown) => !shown)
-  }
+  const isCorrect = solved.has(currentIndex)
 
-  const handleToggleHint = () => {
-    setHintShown((shown) => !shown)
+  const handleSkip = () => {
+    if (isCorrect) return
+    setSkippedSet((prev) => new Set(prev).add(currentIndex))
+    goNext()
   }
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -412,35 +275,50 @@ export default function TypstniquePage() {
     }
   }
 
+  const selectProblem = (idx: number) => {
+    if (advanceTimeoutRef.current) {
+      clearTimeout(advanceTimeoutRef.current)
+      advanceTimeoutRef.current = null
+    }
+    setCurrentIndex(idx)
+    if (window.matchMedia("(max-width: 767px)").matches) setSidebarOpen(false)
+  }
+
   const handleRestart = () => {
     setCurrentIndex(0)
-    setSolved(0)
-    setSkipped(0)
-    setSolvedSet(new Set())
+    setSolved(new Map())
     setSkippedSet(new Set())
-    setSolvedAnswers(new Map())
     setUserInput("")
+    setPreviewSvg("")
+    setPreviewError(false)
+    setSolutionShown(false)
+    setHintShown(false)
     setGameState("playing")
   }
+
+  const solvedCount = solved.size
+  const skippedCount = skippedSet.size
 
   // Loading screen
   if (gameState === "loading") {
     return (
-      <main className="min-h-screen flex items-center justify-center p-6">
-        <div className="text-center space-y-6">
-          <h1 className="font-serif text-5xl md:text-7xl tracking-tight text-foreground">
-            Typstnique
+      <main className="relative flex min-h-dvh items-center justify-center overflow-hidden p-6">
+        <div
+          aria-hidden
+          className="absolute inset-0 bg-dots [mask-image:radial-gradient(ellipse_at_center,black,transparent_65%)]"
+        />
+        <div className="relative space-y-6 text-center">
+          <h1 className="text-6xl md:text-7xl">
+            <Wordmark />
           </h1>
-          <p className="text-sm uppercase tracking-[0.2em] text-muted-foreground">
-            A Typst Math Typing Practice
-          </p>
+          <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground">A Typst Math Typing Practice</p>
           {loadError ? (
             <p className="text-sm text-destructive">{loadError}</p>
           ) : (
-            <div className="flex items-center justify-center gap-2">
-              <span className="w-2 h-2 rounded-full bg-foreground/30 animate-pulse" />
-              <span className="w-2 h-2 rounded-full bg-foreground/30 animate-pulse [animation-delay:150ms]" />
-              <span className="w-2 h-2 rounded-full bg-foreground/30 animate-pulse [animation-delay:300ms]" />
+            <div className="flex items-center justify-center gap-2" aria-label="Loading the Typst compiler">
+              <span className="size-2 animate-pulse rounded-full bg-brand/60" />
+              <span className="size-2 animate-pulse rounded-full bg-brand/60 [animation-delay:150ms]" />
+              <span className="size-2 animate-pulse rounded-full bg-brand/60 [animation-delay:300ms]" />
             </div>
           )}
         </div>
@@ -451,298 +329,329 @@ export default function TypstniquePage() {
   // Done screen
   if (gameState === "done") {
     return (
-      <main className="min-h-screen flex items-center justify-center p-6">
-        <div className="text-center space-y-8 max-w-md">
-          <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground">
-            Completed
+      <main className="relative flex min-h-dvh items-center justify-center overflow-hidden p-6">
+        <div
+          aria-hidden
+          className="absolute inset-0 bg-dots [mask-image:radial-gradient(ellipse_at_center,black,transparent_65%)]"
+        />
+        <div className="relative w-full max-w-md rounded-3xl border bg-card px-8 py-12 text-center shadow-[0_12px_40px_-12px_rgb(15_23_42/0.18)]">
+          <p className="text-xs font-medium uppercase tracking-[0.2em] text-muted-foreground">Completed</p>
+          <p className="mt-4 font-serif text-7xl tracking-tight tabular-nums md:text-8xl">
+            {solvedCount}
+            <span className="text-muted-foreground/50"> / {problems.length}</span>
           </p>
-          <h1 className="font-serif text-6xl md:text-8xl tracking-tight text-foreground">
-            {solved} / {problems.length}
-          </h1>
-          <p className="text-muted-foreground">
-            {skipped > 0 && `${skipped} skipped`}
-          </p>
-          <div className="flex items-center justify-center gap-3">
-            <Button
-              onClick={handleRestart}
-              className="px-8 py-6 text-base"
-            >
-              Play Again
+          {skippedCount > 0 && <p className="mt-2 text-sm text-muted-foreground">{skippedCount} skipped</p>}
+          <div className="mt-10 flex items-center justify-center gap-3">
+            <Button onClick={handleRestart} size="lg" className="rounded-full px-6">
+              <RotateCcw /> Play again
             </Button>
-            <Link href="/">
-              <Button variant="outline" className="px-8 py-6 text-base">
-                ← Home
-              </Button>
-            </Link>
+            <Button asChild variant="outline" size="lg" className="rounded-full px-6">
+              <Link href="/">Home</Link>
+            </Button>
           </div>
         </div>
       </main>
     )
   }
 
+  const problem = problems[currentIndex]
+  const verdict = solved.get(currentIndex)?.verdict
+  const remaining = problems.length - solvedCount - skippedCount
+
   // Game screen
   return (
-    <main className="h-screen flex overflow-hidden">
-      {/* Main content */}
-      <div className="flex-1 flex flex-col items-center justify-center p-6 relative overflow-y-auto">
-        <div className="w-full max-w-2xl space-y-6">
-          {/* Header */}
-          <header className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <Link href="/">
-                <Button variant="outline" size="sm" className="text-xs">
-                  ← Home
-                </Button>
-              </Link>
-              <Link
-                href="/"
-                className="font-serif text-2xl tracking-tight text-foreground hover:text-accent transition-colors"
-              >
-                Typstnique
-              </Link>
-            </div>
-            <div className="flex items-center gap-8">
-              <div className="text-right">
-                <p className="text-[10px] uppercase tracking-[0.15em] text-muted-foreground">
-                  Problem
-                </p>
-                <p className="text-lg font-medium tabular-nums">
-                  {currentIndex + 1} / {problems.length}
-                </p>
-              </div>
-              <div className="text-right">
-                <p className="text-[10px] uppercase tracking-[0.15em] text-muted-foreground">
-                  Solved
-                </p>
-                <p className="text-lg font-medium tabular-nums">{solved}</p>
-              </div>
-            </div>
-          </header>
-
-          {/* Target formula */}
-          <div
-            className={cn(
-              "bg-card border border-border rounded-lg p-10 flex items-center justify-center min-h-[140px] transition-colors duration-300",
-              isCorrect && "border-success bg-success/5"
-            )}
+    <div className="flex h-dvh flex-col">
+      <header className="relative z-20 shrink-0 border-b bg-card/80 backdrop-blur-md">
+        <div className="flex h-14 items-center gap-2 px-2 sm:px-4">
+          <Link
+            href="/"
+            className="group flex items-center gap-2 rounded-md px-2 py-1 text-muted-foreground transition-colors hover:text-foreground"
           >
-            {targetSvg ? (
-              <div
-                className="[&_svg]:max-w-full [&_svg]:h-auto"
-                dangerouslySetInnerHTML={{ __html: targetSvg }}
-              />
-            ) : targetRenderError ? (
-              <p className="text-xs text-destructive font-mono break-all">{targetRenderError}</p>
-            ) : null}
-          </div>
-
-          {/* Input */}
-          <div
-            className={cn(
-              "bg-card border border-border rounded-lg flex items-center px-4 transition-colors duration-200 focus-within:border-foreground/30",
-              isCorrect && "border-success"
+            <ArrowLeft className="size-4 transition-transform group-hover:-translate-x-0.5" />
+            <Wordmark className="text-xl" />
+          </Link>
+          <div className="ml-auto flex items-center gap-1 sm:gap-3">
+            <Stat label="Problem" value={`${currentIndex + 1} / ${problems.length}`} />
+            <Stat label="Solved" icon={Check} value={solvedCount} className="text-success-foreground" />
+            {skippedCount > 0 && (
+              <Stat label="Skipped" value={skippedCount} className="hidden text-warning-foreground sm:flex" />
             )}
-          >
-            <span className="text-accent font-mono text-lg select-none mr-3">$</span>
-            <Input
-              ref={inputRef}
-              type="text"
-              value={userInput}
-              onChange={handleInputChange}
-              onKeyDown={handleKeyDown}
-              placeholder="type typst math..."
-              className="border-0 shadow-none focus-visible:ring-0 font-helvetica py-4 px-0 bg-transparent placeholder:text-muted-foreground/40"
-              autoComplete="off"
-              autoCorrect="off"
-              autoCapitalize="off"
-              spellCheck={false}
-              disabled={isCorrect}
-            />
-            <span className="text-accent font-mono text-lg select-none ml-3">$</span>
-          </div>
-
-          {/* Preview */}
-          <div
-            className={cn(
-              "bg-card border border-border rounded-lg p-6 flex items-center justify-center min-h-[80px] transition-colors duration-300",
-              isCorrect && "border-success bg-success/5"
-            )}
-          >
-            {previewSvg ? (
-              <div
-                className="[&_svg]:max-w-full [&_svg]:h-auto [&_svg]:scale-75"
-                dangerouslySetInnerHTML={{ __html: previewSvg }}
-              />
-            ) : previewError ? (
-              <p className="text-sm text-destructive italic">parse error</p>
-            ) : (
-              <p className="text-sm text-muted-foreground/60 italic">
-                your output appears here
-              </p>
-            )}
-          </div>
-
-          {/* Hint reveal */}
-          {hintShown && problems[currentIndex].hint && (
-            <div className="bg-muted/40 border border-border rounded-lg px-4 py-3 flex items-center gap-3">
-              <span className="text-[10px] uppercase tracking-[0.15em] text-muted-foreground shrink-0">
-                Hint
-              </span>
-              <p className="text-sm text-foreground font-helvetica break-words">
-                {problems[currentIndex].hint}
-              </p>
-            </div>
-          )}
-
-          {/* Solution reveal */}
-          {solutionShown && (
-            <div className="bg-muted/40 border border-border rounded-lg px-4 py-3 flex items-center gap-3">
-              <span className="text-[10px] uppercase tracking-[0.15em] text-muted-foreground shrink-0">
-                Solution
-              </span>
-              <code className="font-mono text-sm text-foreground break-all">
-                {problems[currentIndex].math}
-              </code>
-            </div>
-          )}
-
-          {/* Footer */}
-          <footer className="flex items-center justify-between">
-            <p className="text-xs text-muted-foreground">
-              {problems.length - solvedSet.size - skippedSet.size} remaining
-              {skipped > 0 && ` · ${skipped} skipped`}
-            </p>
-            <div className="flex items-center gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleToggleHint}
-                disabled={!problems[currentIndex]?.hint}
-                className="text-xs"
-              >
-                {problems[currentIndex]?.hint
-                  ? hintShown ? "Hide Hint" : "Hint"
-                  : "No Hint"}
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleToggleSolution}
-                className="text-xs"
-              >
-                {solutionShown ? "Hide Solution" : "Show Solution"}
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleSkip}
-                disabled={isCorrect}
-                className="text-xs"
-              >
-                Skip{" "}
-                <kbd className="ml-2 px-1.5 py-0.5 text-[10px] bg-muted rounded">
-                  Tab
-                </kbd>
-              </Button>
-            </div>
-          </footer>
-
-          <p className="text-xs text-muted-foreground/60 text-center pt-2">
-            Feeling stuck? See{" "}
-            <a
-              href="https://typst.app/docs/reference/"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="underline underline-offset-2 hover:text-muted-foreground transition-colors"
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={() => setSidebarOpen((open) => !open)}
+              aria-label={sidebarOpen ? "Hide problems list" : "Show problems list"}
+              className="text-muted-foreground"
             >
-              typst.app/docs/reference
-            </a>{" "}
-            for help.
-          </p>
+              {sidebarOpen ? <PanelRightClose /> : <PanelRightOpen />}
+            </Button>
+          </div>
         </div>
+        <div className="absolute inset-x-0 -bottom-px h-0.5">
+          <div
+            className="h-full bg-brand transition-[width] duration-500"
+            style={{ width: `${(solvedCount / problems.length) * 100}%` }}
+          />
+        </div>
+      </header>
 
-        {/* Toggle button */}
-        <button
-          onClick={() => setSidebarOpen(!sidebarOpen)}
-          className="absolute right-4 top-4 p-2 text-muted-foreground hover:text-foreground transition-colors"
-          aria-label={sidebarOpen ? "Hide problems list" : "Show problems list"}
-        >
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            width="20"
-            height="20"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          >
-            <rect x="3" y="3" width="18" height="18" rx="2" />
-            <path d="M15 3v18" />
-          </svg>
-        </button>
-      </div>
+      <div className="flex min-h-0 flex-1">
+        <main className="relative flex-1 overflow-y-auto [scrollbar-gutter:stable]">
+          <div
+            aria-hidden
+            className="pointer-events-none absolute inset-x-0 top-0 h-96 bg-dots [mask-image:linear-gradient(to_bottom,black,transparent)]"
+          />
+          <div className="relative mx-auto w-full max-w-3xl space-y-4 px-4 py-8 sm:px-6 md:py-14">
+            {/* Target formula */}
+            <section
+              className={cn(
+                "rounded-2xl border bg-card shadow-[0_1px_2px_rgb(15_23_42/0.04),0_8px_24px_-12px_rgb(15_23_42/0.12)] transition-[border-color,box-shadow] duration-300",
+                isCorrect && "border-success/50 ring-4 ring-success/10",
+              )}
+            >
+              <CardLabel>
+                <span>Target</span>
+                <span className="normal-case tracking-normal tabular-nums">#{currentIndex + 1}</span>
+              </CardLabel>
+              <div className="flex min-h-[180px] items-center justify-center overflow-x-auto px-6 pb-10 pt-4">
+                {targetSvg ? (
+                  <div
+                    className="md:[zoom:1.25] [&_svg]:h-auto [&_svg]:max-w-full"
+                    dangerouslySetInnerHTML={{ __html: targetSvg }}
+                  />
+                ) : targetRenderError ? (
+                  <p className="break-all font-mono text-xs text-destructive">{targetRenderError}</p>
+                ) : (
+                  <div className="h-10 w-48 animate-pulse rounded-lg bg-muted" />
+                )}
+              </div>
+            </section>
 
-      {/* Problems sidebar - right side */}
-      <aside
-        className={cn(
-          "border-l border-border bg-card/50 flex flex-col transition-all duration-300 overflow-hidden",
-          sidebarOpen ? "w-36" : "w-0 border-0"
+            {/* Input */}
+            <div
+              className={cn(
+                "flex items-center gap-3 rounded-2xl border bg-card px-4 shadow-xs transition-[border-color,box-shadow] duration-200 focus-within:border-brand/60 focus-within:ring-4 focus-within:ring-brand/15 sm:px-5",
+                isCorrect && "border-success/50",
+              )}
+            >
+              <span className="select-none font-mono text-lg text-brand">$</span>
+              <input
+                ref={inputRef}
+                type="text"
+                value={userInput}
+                onChange={handleInputChange}
+                onKeyDown={handleKeyDown}
+                placeholder="type typst math..."
+                aria-label="Your Typst math"
+                className="min-w-0 flex-1 bg-transparent py-4 font-helvetica text-lg outline-none placeholder:text-muted-foreground/50"
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck={false}
+                disabled={isCorrect}
+                autoFocus
+              />
+              <span className="select-none font-mono text-lg text-brand">$</span>
+              {isCorrect && (
+                <span className="grid size-6 shrink-0 animate-in zoom-in-50 place-items-center rounded-full bg-success text-white">
+                  <Check className="size-3.5" strokeWidth={3} />
+                </span>
+              )}
+            </div>
+
+            {/* Preview */}
+            <section
+              className={cn(
+                "rounded-2xl border border-dashed bg-card/60 transition-colors duration-300",
+                isCorrect && "border-solid border-success/40 bg-success/5",
+              )}
+              aria-live="polite"
+            >
+              <CardLabel>
+                {verdict ? (
+                  <span className="inline-flex items-center gap-1.5 text-success-foreground">
+                    <Check className="size-3.5" strokeWidth={2.5} />
+                    {verdict === "exact" ? "Correct" : "Accepted — close enough"}
+                  </span>
+                ) : previewError ? (
+                  <span className="text-destructive">Can&apos;t render this yet</span>
+                ) : (
+                  <span>Your output</span>
+                )}
+              </CardLabel>
+              <div className="flex min-h-[110px] items-center justify-center overflow-x-auto px-6 pb-8 pt-3">
+                {previewSvg ? (
+                  <div
+                    className={cn("transition-opacity md:[zoom:1.25] [&_svg]:h-auto [&_svg]:max-w-full", previewError && "opacity-30")}
+                    dangerouslySetInnerHTML={{ __html: previewSvg }}
+                  />
+                ) : (
+                  <p className="text-sm italic text-muted-foreground/70">
+                    {previewError ? "parse error" : "your output appears here"}
+                  </p>
+                )}
+              </div>
+              {verdict === "equivalent" && (
+                <p className="border-t border-success/20 px-5 py-3 text-xs text-muted-foreground">
+                  Typst draws it (almost) the same. The reference writes it as{" "}
+                  <code className="rounded bg-card px-1.5 py-0.5 font-mono text-foreground">{problem.math}</code>
+                </p>
+              )}
+            </section>
+
+            {hintShown && problem.hint && (
+              <Reveal icon={Lightbulb} label="Hint">
+                <p className="break-words font-helvetica">{problem.hint}</p>
+              </Reveal>
+            )}
+            {solutionShown && (
+              <Reveal icon={Eye} label="Solution">
+                <code className="break-all font-mono">{problem.math}</code>
+              </Reveal>
+            )}
+
+            <footer className="flex flex-wrap items-center justify-between gap-3 pt-1">
+              <p className="text-xs tabular-nums text-muted-foreground">
+                {remaining} remaining
+                {skippedCount > 0 && ` · ${skippedCount} skipped`}
+              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button variant="outline" size="sm" onClick={() => setHintShown((s) => !s)} disabled={!problem.hint}>
+                  <Lightbulb />
+                  {problem.hint ? (hintShown ? "Hide hint" : "Hint") : "No hint"}
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => setSolutionShown((s) => !s)}>
+                  {solutionShown ? <EyeOff /> : <Eye />}
+                  {solutionShown ? "Hide solution" : "Show solution"}
+                </Button>
+                <Button variant="outline" size="sm" onClick={handleSkip} disabled={isCorrect}>
+                  <SkipForward />
+                  Skip
+                  <kbd className="ml-0.5 hidden rounded border bg-muted px-1.5 py-px font-sans text-[10px] font-normal text-muted-foreground sm:inline">
+                    Tab
+                  </kbd>
+                </Button>
+              </div>
+            </footer>
+
+            <p className="pt-6 text-center text-xs text-muted-foreground">
+              Feeling stuck? See{" "}
+              <a
+                href="https://typst.app/docs/reference/"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline underline-offset-2 transition-colors hover:text-foreground"
+              >
+                typst.app/docs/reference
+              </a>{" "}
+              for help.
+            </p>
+          </div>
+        </main>
+
+        {/* Problems sidebar - right side; an overlay on small screens */}
+        {sidebarOpen && (
+          <div
+            aria-hidden
+            className="fixed inset-0 z-30 bg-foreground/20 md:hidden"
+            onClick={() => setSidebarOpen(false)}
+          />
         )}
-      >
-        <h2 className="text-xs uppercase tracking-[0.15em] text-muted-foreground px-3 pt-4 pb-2 shrink-0">
-          Problems
-        </h2>
-        <div className="overflow-y-auto flex-1 px-2 pb-4">
-          <div className="space-y-1">
-            {problems.map((_, idx) => {
-              const isSolved = solvedSet.has(idx)
-              const isSkipped = skippedSet.has(idx)
-              const isCurrent = idx === currentIndex
+        <aside
+          className={cn(
+            "shrink-0 overflow-hidden border-l bg-card transition-[width] duration-300 max-md:fixed max-md:inset-y-0 max-md:right-0 max-md:z-40 max-md:shadow-xl",
+            sidebarOpen ? "w-64" : "w-0 border-l-0",
+          )}
+        >
+          <div className="flex h-full w-64 flex-col">
+            <div className="flex items-baseline justify-between px-4 pb-2 pt-5">
+              <h2 className="text-sm font-medium">Problems</h2>
+              <span className="text-xs tabular-nums text-muted-foreground">
+                {solvedCount} / {problems.length}
+              </span>
+            </div>
+            <div className="flex gap-4 px-4 pb-4 text-[11px] text-muted-foreground">
+              <span className="inline-flex items-center gap-1.5">
+                <span className="size-2 rounded-sm bg-success/60" /> Solved
+              </span>
+              <span className="inline-flex items-center gap-1.5">
+                <span className="size-2 rounded-sm bg-warning/60" /> Skipped
+              </span>
+            </div>
+            <div className="flex-1 overflow-y-auto px-4 pb-6">
+              <div className="grid grid-cols-6 gap-1.5">
+                {problems.map((_, idx) => {
+                  const isSolved = solved.has(idx)
+                  const isSkipped = skippedSet.has(idx)
+                  const isCurrent = idx === currentIndex
 
-              return (
-                <button
-                  key={idx}
-                  onClick={() => {
-                    if (advanceTimeoutRef.current) {
-                      clearTimeout(advanceTimeoutRef.current)
-                      advanceTimeoutRef.current = null
-                    }
-                    setCurrentIndex(idx)
-                  }}
-                  className={cn(
-                    "w-full text-left px-2 py-1.5 rounded-md text-sm tabular-nums transition-colors flex items-center justify-between gap-1",
-                    isCurrent
-                      ? "bg-foreground text-background"
-                      : isSolved
-                        ? "bg-success/10 hover:bg-success/20"
-                        : isSkipped
-                          ? "bg-muted hover:bg-muted/80"
-                          : "text-muted-foreground hover:bg-muted/50"
-                  )}
-                >
-                  <span>{idx + 1}</span>
-                  {(isSolved || isSkipped) && (
-                    <span
+                  return (
+                    <button
+                      key={idx}
+                      data-problem={idx}
+                      onClick={() => selectProblem(idx)}
+                      aria-label={`Problem ${idx + 1}${isSolved ? ", solved" : isSkipped ? ", skipped" : ""}`}
+                      aria-current={isCurrent ? "step" : undefined}
                       className={cn(
-                        "text-[9px] uppercase tracking-wider px-1 py-0.5 rounded shrink-0",
+                        "grid aspect-square place-items-center rounded-md text-[11px] font-medium tabular-nums transition-colors",
                         isCurrent
-                          ? "bg-background/20 text-background"
+                          ? "bg-foreground text-background ring-2 ring-brand/50 ring-offset-1 ring-offset-card"
                           : isSolved
-                            ? "bg-success/20 text-success"
-                            : "bg-foreground/10 text-muted-foreground"
+                            ? "bg-success/15 text-success-foreground hover:bg-success/25"
+                            : isSkipped
+                              ? "bg-warning/15 text-warning-foreground hover:bg-warning/25"
+                              : "bg-muted text-muted-foreground hover:bg-accent hover:text-accent-foreground",
                       )}
                     >
-                      {isSolved ? "✓" : "—"}
-                    </span>
-                  )}
-                </button>
-              )
-            })}
+                      {idx + 1}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
           </div>
-        </div>
-      </aside>
-    </main>
+        </aside>
+      </div>
+    </div>
+  )
+}
+
+function Stat({
+  label,
+  value,
+  icon: Icon,
+  className,
+}: {
+  label: string
+  value: React.ReactNode
+  icon?: LucideIcon
+  className?: string
+}) {
+  return (
+    <div className={cn("flex items-center gap-1.5 px-1.5 text-sm", className)}>
+      <span className="hidden text-xs text-muted-foreground sm:inline">{label}</span>
+      {Icon && <Icon className="size-3.5 sm:hidden" strokeWidth={2.5} aria-label={label} />}
+      <span className="font-medium tabular-nums">{value}</span>
+    </div>
+  )
+}
+
+function CardLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="flex items-center justify-between px-5 pt-4 text-[11px] font-medium uppercase tracking-[0.12em] text-muted-foreground">
+      {children}
+    </div>
+  )
+}
+
+function Reveal({ icon: Icon, label, children }: { icon: LucideIcon; label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex items-start gap-3 rounded-xl border border-brand/20 bg-accent/60 px-4 py-3 text-sm animate-in fade-in slide-in-from-top-1">
+      <span className="mt-0.5 inline-flex shrink-0 items-center gap-1.5 text-[11px] font-medium uppercase tracking-[0.12em] text-accent-foreground">
+        <Icon className="size-3.5" />
+        {label}
+      </span>
+      <div className="min-w-0 text-foreground">{children}</div>
+    </div>
   )
 }
