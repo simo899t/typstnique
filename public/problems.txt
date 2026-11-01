@@ -97,4 +97,4 @@ hat(f)(xi) = integral_(-oo)^oo f(x) e^(-2 pi i x xi) dif x # hat, xi
 f(x) = 1 / (2 pi) integral_(-oo)^oo hat(f)(xi) e^(2 pi i x xi) dif xi
 c_n = 1 / (2 pi) integral_(-pi)^pi f(x) e^(-i n x) dif x
 sum_(n = -oo)^oo abs(c_n)^2 = 1 / (2 pi) integral_(-pi)^pi abs(f(x))^2 dif x
-sum_(k = 0)^(n - 1) e^(2 pi i k / n) = 0
+sum_(k = 0)^(n - 1) e^(2 pi i k \/ n) = 0

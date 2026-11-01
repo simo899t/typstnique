@@ -256,10 +256,10 @@ $ ((p or (q iimp r))^dag bi not (r and p))^dag = (not p or (not q iimp not r)) b
 
   The proof by induction shows that:
   
-  $ [[phi^dag]]_v' = [[phi]]_v  $
+  $ ip(phi^dag)_v' = ip(phi)_v  $
   
   And from the definition of satisfiability:
-  $ exists v:  [[phi]]_v = T implies exists v': [[phi^dag]]_v =T $
+  $ exists v:  ip(phi)_v = T iimp exists v': ip(phi^dag)_v =T $
   
   
   
@@ -269,9 +269,9 @@ $ ((p or (q iimp r))^dag bi not (r and p))^dag = (not p or (not q iimp not r)) b
 
 
  
-2. Find a formula $phi$ such that $phi$ is neither a tautology nor a contradiction and $phi$ and $phid$ are logically equivalent? Find one or prove that none exists.
+1. Find a formula $phi$ such that $phi$ is neither a tautology nor a contradiction and $phi$ and $phid$ are logically equivalent? Find one or prove that none exists.
 
-  Assume that $phi$ is satisfiable and falsifiable which means: $  &exists v . P -> bool: [[phi]]_v = T \ &exists f . P -> bool: [[phi]]_f = F $
+  Assume that $phi$ is satisfiable and falsifiable which means: $  &exists v . P -> bool: ip(phi)_v = T \ &exists f . P -> bool: ip(phi)_f = F $
 
 
   From definition 5.8, two sentences $phi, psi$ are logically equivalent if:
